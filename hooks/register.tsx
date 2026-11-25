@@ -4,7 +4,7 @@ import type { EngineInterface, Register, SessionContextUsage, SessionRateLimit }
 import type { Locale, QuotaUsage, QuotaWindow } from '../types'
 import { DEFAULT_LOCALE, MESSAGES, localeFromLanguageName, normalizeLocale } from './i18n'
 
-// claude-mod-usage: Claude context / 5-hour / 7-day usage as gradient progress bars above the prompt
+// claude-mod-usage-remaining: Claude context / 5-hour / 7-day quota REMAINING as draining gradient bars above the prompt
 
 // Bar keys: React key, SVG id prefix and icon table key
 const SegmentKey = {
@@ -30,6 +30,14 @@ const CELL_PX_ESTIMATE = 7 // rough px per column (the API has no real value); u
 // Bar
 const BAR_HEIGHT = 8 // bar thickness (CSS px)
 const EMPTY_COLOR = '#3c3c3c' // unfilled track
+// 5-hour and 7-day bars: one pill per hour / day, a small gap between pills, and the even-pace marker
+const FIVE_HOURS = 5
+const FIVE_MS = 5 * 3_600_000
+const WEEK_DAYS = 7
+const WEEK_MS = 7 * 86_400_000
+const PILL_GAP_PX = 1 // estimated px (see CELL_PX_ESTIMATE); Desktop columns run ~2x the estimate, so 1 ≈ 4 device px at @2x
+const MIN_PILL_PX = 12
+const PACE_COLOR = '#ffffff'
 
 // Percent label on the bar: white text with a dark outline, readable on green, yellow, red and the dark track
 const LABEL_FONT_SIZE = 12
@@ -54,8 +62,8 @@ const ICON_LINE_COLOR = '#8a8a8a' // mid grey, visible on dark and light themes
 const ICON_FONT = `font-family="-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif" font-weight="700"`
 
 // Session state: latest usage and the resolved display language
-const usage = atom({ plugin: 'mod-usage', key: 'usage' } as const, null)
-const locale = atom({ plugin: 'mod-usage', key: 'locale' } as const, DEFAULT_LOCALE)
+const usage = atom({ plugin: 'mod-usage-remaining', key: 'usage' } as const, null)
+const locale = atom({ plugin: 'mod-usage-remaining', key: 'locale' } as const, DEFAULT_LOCALE)
 
 // Picks one rate-limit window and converts resetsAt to epoch ms
 const _pickWindow = (rateLimits: SessionRateLimit[], kind: string): QuotaWindow | undefined => {
@@ -159,29 +167,75 @@ const _timeSvg = (text: string, rtl = false): { source: string; width: number; c
   return { source, width, cells: Math.ceil(width / CELL_PX_ESTIMATE) }
 }
 
-// The bar: dark pill track + green → yellow → red gradient, filled to the usage level.
+// The bar: dark pill track + green → yellow → red gradient, filled to the REMAINING level. It is drawn mirrored:
+// it drains from the left, so the last of the quota is the red right end and time reads left → right (pace tick moves right).
 // Drawn as a plain image (an isInteractive frame paints a white background on Desktop, showing past the round ends).
 // The image is stretched to the column width, so the bar is a round-capped line with non-scaling-stroke:
 // stroke width and caps are computed in screen space and stay circular. Caps reach half a stroke past the
 // endpoints, so the endpoints are inset by an estimated px width to keep the caps inside the image.
-const _barSvg = (key: TSegmentKey, percent: number, barCells: number): string => {
-  const filled = Math.min(100, Math.max(0, percent))
-  const inset = (BAR_HEIGHT / 2 / (barCells * CELL_PX_ESTIMATE)) * 1000
-  const trackEnd = 1000 - inset
-  const fillEnd = inset + ((trackEnd - inset) * filled) / 100
+// Optional extras: `segments` splits the bar into that many pills (one per hour on the 5-hour bar, one per day on the 7-day bar) and
+// `pacePercent` draws a thin marker where the bar would be with perfectly even use over the window.
+interface IBarOptions {
+  segments?: number
+  pacePercent?: number
+}
+
+const _barSvg = (key: TSegmentKey, remainingPercent: number, barCells: number, options: IBarOptions = {}): string => {
+  const filled = Math.min(100, Math.max(0, remainingPercent)) / 100
+  const unitsPerPx = 1000 / (barCells * CELL_PX_ESTIMATE)
+  const cap = (BAR_HEIGHT / 2) * unitsPerPx
   const centerY = BAR_HEIGHT / 2
   const lineAttrs = `stroke-width="${BAR_HEIGHT}" stroke-linecap="round" vector-effect="non-scaling-stroke"`
-  return [
+
+  // Pills: each owns an equal share of the width; caps and a small gap stay inside that share.
+  // Too narrow for readable pills → one plain bar.
+  let count = Math.max(1, Math.floor(options.segments ?? 1))
+  const gap = count > 1 ? PILL_GAP_PX * unitsPerPx : 0
+  if (count > 1 && (1000 / count) / unitsPerPx < MIN_PILL_PX) count = 1
+  const share = 1000 / count
+  const pills = Array.from({ length: count }, (_, i) => {
+    const start = i * share + cap + (i === 0 ? 0 : gap / 2)
+    const end = (i + 1) * share - cap - (i === count - 1 ? 0 : gap / 2)
+    return { start, end: Math.max(start, end) }
+  })
+
+  // Maps a 0–1 fraction of the whole bar to an x inside the pills (fills skip the gaps)
+  const xAt = (fraction: number): number => {
+    const scaled = Math.min(1, Math.max(0, fraction)) * count
+    const index = Math.min(count - 1, Math.floor(scaled))
+    const pill = pills[index]!
+    return pill.start + (pill.end - pill.start) * (scaled - index)
+  }
+
+  const parts = [
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 ${BAR_HEIGHT}" preserveAspectRatio="none" width="4000" height="${BAR_HEIGHT}">`,
     '<defs>',
     `<linearGradient id="grad-${key}" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="1000" y2="0">`,
-    '<stop offset="0" stop-color="#00c800"/><stop offset="0.5" stop-color="#ffc800"/><stop offset="1" stop-color="#ff0000"/>',
+    '<stop offset="0" stop-color="#ff0000"/><stop offset="0.5" stop-color="#ffc800"/><stop offset="1" stop-color="#00c800"/>',
     '</linearGradient>',
     '</defs>',
-    `<line x1="${inset.toFixed(2)}" y1="${centerY}" x2="${trackEnd.toFixed(2)}" y2="${centerY}" stroke="${EMPTY_COLOR}" ${lineAttrs}/>`,
-    `<line x1="${inset.toFixed(2)}" y1="${centerY}" x2="${fillEnd.toFixed(2)}" y2="${centerY}" stroke="url(#grad-${key})" ${lineAttrs}/>`,
-    '</svg>'
-  ].join('')
+    '<g transform="translate(1000 0) scale(-1 1)">'
+  ]
+  pills.forEach(({ start, end }, i) => {
+    parts.push(`<line x1="${start.toFixed(2)}" y1="${centerY}" x2="${end.toFixed(2)}" y2="${centerY}" stroke="${EMPTY_COLOR}" ${lineAttrs}/>`)
+    const pillFill = Math.min(1, Math.max(0, filled * count - i))
+    if (pillFill > 0) {
+      const fillEnd = start + (end - start) * pillFill
+      parts.push(`<line x1="${start.toFixed(2)}" y1="${centerY}" x2="${fillEnd.toFixed(2)}" y2="${centerY}" stroke="url(#grad-${key})" ${lineAttrs}/>`)
+    }
+  })
+  if (options.pacePercent !== undefined) {
+    const x = xAt(options.pacePercent / 100).toFixed(2)
+    parts.push(`<line class="pace" x1="${x}" y1="0" x2="${x}" y2="${BAR_HEIGHT}" stroke="${PACE_COLOR}" stroke-width="2" vector-effect="non-scaling-stroke"/>`)
+  }
+  parts.push('</g>', '</svg>')
+  return parts.join('')
+}
+
+// Even-use pace: share of the window still ahead, which is how much quota would be left if used evenly
+const _pacePercent = (resetsAt: number | undefined, nowMs: number, windowMs: number): number | undefined => {
+  if (resetsAt === undefined) return undefined
+  return Math.min(100, Math.max(0, ((resetsAt - nowMs) / windowMs) * 100))
 }
 
 // Resolves the display language: user option → Claude Code setting → LC_ALL / LC_MESSAGES / LANG → macOS → English
@@ -266,9 +320,18 @@ export const register: Register = (on, options) => {
     const totalFixed = fixedWidths.reduce((sum, width) => sum + width, 0)
     const barLen = Math.max(MIN_BAR_LEN, Math.floor((e.props.bodyColumns - totalGap - totalFixed) / segmentInputs.length))
 
-    // One block: icon (accent follows usage) + bar (outlined percent centred on it) + reset countdown
-    const renderSegment = ({ key, name, percent }: ISegmentInput, index: number) => {
-      const percentLabel = `${Math.round(percent)}%`
+    // One block: icon (accent follows usage: green = plenty left, red = nearly out) + bar showing what is LEFT
+    // (outlined remaining percent centred on it) + time left until reset
+    const renderSegment = ({ key, name, percent, resetsAt }: ISegmentInput, index: number) => {
+      const left = Math.min(100, Math.max(0, 100 - percent))
+      // 5-hour and 7-day bars: one pill per hour / day plus the even-pace marker; context stays a plain bar
+      const barOptions: IBarOptions =
+        key === SegmentKey.WEEK
+          ? { segments: WEEK_DAYS, pacePercent: _pacePercent(resetsAt, nowMs, WEEK_MS) }
+          : key === SegmentKey.FIVE
+            ? { segments: FIVE_HOURS, pacePercent: _pacePercent(resetsAt, nowMs, FIVE_MS) }
+            : {}
+      const percentLabel = `${Math.round(left)}%`
       const remaining = remainings[index] ?? ''
       const timeSvg = timeSvgs[index] ?? null
       const segmentWidth = (fixedWidths[index] ?? 0) + barLen
@@ -281,7 +344,7 @@ export const register: Register = (on, options) => {
             <Svg source={_iconSources[key](_accentColor(percent))} alt={name} width={ICON_SIZE} height={ICON_SIZE} />
           </Box>
           <Box position="relative" flexDirection="column" justifyContent="center" width={barLen} flexGrow={1} flexShrink={1}>
-            <Svg source={_barSvg(key, percent, barLen)} alt={alt} height={BAR_HEIGHT} />
+            <Svg source={_barSvg(key, left, barLen, barOptions)} alt={alt} height={BAR_HEIGHT} />
             <Box position="absolute" top={0} bottom={0} left={0} right={0} justifyContent="center" alignItems="center">
               <Svg source={percentSvg.source} alt={percentLabel} width={percentSvg.width} height={LABEL_HEIGHT} />
             </Box>
