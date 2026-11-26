@@ -4,7 +4,8 @@ import type { EngineInterface, Register, SessionContextUsage, SessionRateLimit }
 import type { Locale, QuotaUsage, QuotaWindow } from '../types'
 import { DEFAULT_LOCALE, MESSAGES, localeFromLanguageName, normalizeLocale } from './i18n'
 
-// claude-mod-usage-remaining: Claude context / 5-hour / 7-day quota REMAINING as draining gradient bars above the prompt
+// claude-mod-usage-remaining: Claude context / 5-hour / 7-day usage as used-first bars above the prompt; the 5-hour and 7-day
+// bars are the window's clock (one pill per hour / day) with a `now` needle and an amber → red band for allowance spent ahead of schedule
 
 // Bar keys: React key, SVG id prefix and icon table key
 const SegmentKey = {
@@ -23,28 +24,50 @@ interface ISegmentInput {
 }
 
 // Layout
-const SEGMENT_GAP = 2 // columns between bars
-const MIN_BAR_LEN = 6 // a bar never gets narrower than this many columns (fits "100%")
+const SEGMENT_GAP = 2 // columns between bar blocks
+const COMPACT_SEGMENT_GAP = 1 // columns between bar blocks in the narrow mode
+const MIN_BAR_LEN = 6 // a bar never gets narrower than this many columns
 const CELL_PX_ESTIMATE = 7 // rough px per column (the API has no real value); used to inset round caps and size text slots
 
 // Bar
 const BAR_HEIGHT = 8 // bar thickness (CSS px)
 const EMPTY_COLOR = '#3c3c3c' // unfilled track
-// 5-hour and 7-day bars: one pill per hour / day, a small gap between pills, and the even-pace marker
+// 5-hour and 7-day bars: one pill per hour / day (boundaries on the time axis), a small gap between pills
 const FIVE_HOURS = 5
 const FIVE_MS = 5 * 3_600_000
 const WEEK_DAYS = 7
 const WEEK_MS = 7 * 86_400_000
 const PILL_GAP_PX = 1 // estimated px (see CELL_PX_ESTIMATE); Desktop columns run ~2x the estimate, so 1 ≈ 4 device px at @2x
 const MIN_PILL_PX = 12
-const PACE_COLOR = '#ffffff'
+const PILL_RADIUS_PX = 2 // corner radius of a pill's inner ends (estimated px); small, so short pills read as segments, not dots
+// Below this many columns per bar the 7-day bar loses its pills (7 pills × 12px = 84px = 12 columns), so the row goes compact
+const NARROW_BAR_CELLS = (WEEK_DAYS * MIN_PILL_PX) / CELL_PX_ESTIMATE
 
-// Percent label on the bar: white text with a dark outline, readable on green, yellow, red and the dark track
-const LABEL_FONT_SIZE = 12
+// Quota bar colours: calm green fill, level alarm only near the end, amber → red band for allowance spent ahead of schedule
+const QUOTA_OK_COLOR = '#34c759'
+const QUOTA_WARN_COLOR = '#ffb020'
+const QUOTA_ALARM_COLOR = '#ff3b30'
+const LEVEL_WARN_PERCENT = 90 // used ≥ this: amber fill and icon
+const LEVEL_ALARM_PERCENT = 97 // used ≥ this: red fill and icon
+const OVERSHOOT_WARN_POINTS = 3 // used − elapsed ≥ this: amber icon
+const OVERSHOOT_ALARM_POINTS = 15 // used − elapsed ≥ this: red icon
+// `now` needle: a 2px white core on a 4px dark halo, full bar height, drawn last
+const NEEDLE_COLOR = '#ffffff'
+const NEEDLE_HALO_COLOR = '#1e1e1e'
+
+// Percent label beside the bar: white text with a dark outline, right-aligned in a fixed slot left of the bar
 const LABEL_HEIGHT = 16
-const LABEL_CHAR_PX = 8 // bold digit width, estimated on the generous side so nothing is clipped
 const LABEL_FILL_COLOR = '#ffffff'
 const LABEL_STROKE_COLOR = '#1e1e1e'
+// `charPx` sizes the label's SLOT in columns (chars × charPx + 6 → cells); the SVG itself is sized from real glyph widths
+const LABEL_STYLES = {
+  normal: { fontSize: 12, charPx: 8, stroke: 3 },
+  compact: { fontSize: 11, charPx: 7, stroke: 2.5 } // narrow mode: saves a column per block
+} as const
+// Bold system-font glyphs (measured in Chromium with SF Pro): digits ≈ 0.69em, "%" ≈ 1.04em; rounded up so nothing clips
+const LABEL_DIGIT_EM = 0.72
+const LABEL_PERCENT_EM = 1.08
+type TLabelStyle = keyof typeof LABEL_STYLES
 
 // Reset countdown to the right of the bar: monospace digits
 const TIME_FONT_SIZE = 12
@@ -133,16 +156,22 @@ const _iconSources: Record<TSegmentKey, (accent: string) => string> = {
     )
 }
 
-// Percent label: outlined SVG text (Text has no outline); a fixed width/height keeps it from being stretched
-const _labelSvg = (label: string): { source: string; width: number } => {
-  const width = Math.ceil(label.length * LABEL_CHAR_PX + 6)
+// Percent label: outlined SVG text (Text has no outline); a fixed width/height keeps it from being stretched.
+// Text is anchored at the right edge, inset by half the outline, so it sits tight against the bar. The SVG is as wide
+// as the glyphs plus the outline, so the left edge never clips; `cells` (the slot) keeps the column estimate, so at
+// exactly 7px per column a compact label may reach a couple of px into the gap before it
+const _labelSvg = (label: string, style: TLabelStyle = 'normal'): { source: string; width: number; cells: number } => {
+  const { fontSize, charPx, stroke } = LABEL_STYLES[style]
+  const glyphPx = [...label].reduce((sum, char) => sum + fontSize * (char === '%' ? LABEL_PERCENT_EM : LABEL_DIGIT_EM), 0)
+  const width = Math.ceil(glyphPx + stroke + 1)
+  const anchorX = width - stroke / 2 - 0.5
   const source = [
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${LABEL_HEIGHT}" width="${width}" height="${LABEL_HEIGHT}">`,
-    `<text x="${width / 2}" y="${LABEL_HEIGHT / 2}" text-anchor="middle" dominant-baseline="central" font-size="${LABEL_FONT_SIZE}" ${ICON_FONT}`,
-    ` fill="${LABEL_FILL_COLOR}" stroke="${LABEL_STROKE_COLOR}" stroke-width="3" stroke-linejoin="round" paint-order="stroke">${_escapeXml(label)}</text>`,
+    `<text x="${anchorX}" y="${LABEL_HEIGHT / 2}" text-anchor="end" dominant-baseline="central" font-size="${fontSize}" ${ICON_FONT}`,
+    ` fill="${LABEL_FILL_COLOR}" stroke="${LABEL_STROKE_COLOR}" stroke-width="${stroke}" stroke-linejoin="round" paint-order="stroke">${_escapeXml(label)}</text>`,
     '</svg>'
   ].join('')
-  return { source, width }
+  return { source, width, cells: Math.ceil((label.length * charPx + 6) / CELL_PX_ESTIMATE) }
 }
 
 // Glyph width of the countdown text, per script
@@ -167,75 +196,130 @@ const _timeSvg = (text: string, rtl = false): { source: string; width: number; c
   return { source, width, cells: Math.ceil(width / CELL_PX_ESTIMATE) }
 }
 
-// The bar: dark pill track + green → yellow → red gradient, filled to the REMAINING level. It is drawn mirrored:
-// it drains from the left, so the last of the quota is the red right end and time reads left → right (pace tick moves right).
-// Drawn as a plain image (an isInteractive frame paints a white background on Desktop, showing past the round ends).
-// The image is stretched to the column width, so the bar is a round-capped line with non-scaling-stroke:
-// stroke width and caps are computed in screen space and stay circular. Caps reach half a stroke past the
-// endpoints, so the endpoints are inset by an estimated px width to keep the caps inside the image.
-// Optional extras: `segments` splits the bar into that many pills (one per hour on the 5-hour bar, one per day on the 7-day bar) and
-// `pacePercent` draws a thin marker where the bar would be with perfectly even use over the window.
+// The bar fills left → right with USED. Drawn as a plain image (an isInteractive frame paints a white background on
+// Desktop, showing past the round ends). The image is stretched horizontally to the column width, so:
+//   - the bar's shape is a mask: one rounded rectangle per pill (small corners, so short pills read as segments, not
+//     dots), plus a round cap at each outer end of the whole bar. The caps are round-capped lines with non-scaling-stroke,
+//     so they stay circular however far the image is stretched; the corner radius is set in estimated px;
+//   - track, fill and band are plain rectangles drawn through that mask, so they follow the pills and skip the gaps;
+//   - the needle is a non-scaling stroke, so its width is exact px.
+// Context: one pill, filled with a green → yellow → red gradient across the whole bar (green at 0%, red at 100%).
+// 5-hour / 7-day: the track is the window's clock, split into `segments` pills (one per hour / day). The pills are only
+// boundaries on the axis: the fill is still allowance used and can stop mid-pill. With `elapsedPercent`:
+//   - a `now` needle marks elapsed time (never the fill tip), drawn last so nothing covers it;
+//   - fill past `now` is allowance spent ahead of schedule, drawn as an amber → red band from `now` to the fill tip.
+//   Fill short of `now` is headroom and stays calm green.
 interface IBarOptions {
   segments?: number
-  pacePercent?: number
+  elapsedPercent?: number
 }
 
-const _barSvg = (key: TSegmentKey, remainingPercent: number, barCells: number, options: IBarOptions = {}): string => {
-  const filled = Math.min(100, Math.max(0, remainingPercent)) / 100
-  const unitsPerPx = 1000 / (barCells * CELL_PX_ESTIMATE)
-  const cap = (BAR_HEIGHT / 2) * unitsPerPx
-  const centerY = BAR_HEIGHT / 2
-  const lineAttrs = `stroke-width="${BAR_HEIGHT}" stroke-linecap="round" vector-effect="non-scaling-stroke"`
+const _clampPercent = (value: number): number => Math.min(100, Math.max(0, value))
+const _clampUnit = (value: number): number => Math.min(1, Math.max(0, value))
 
-  // Pills: each owns an equal share of the width; caps and a small gap stay inside that share.
-  // Too narrow for readable pills → one plain bar.
+// Base fill of a quota bar: calm green, a level alarm only near the end
+const _levelColor = (usedPercent: number): string =>
+  usedPercent >= LEVEL_ALARM_PERCENT ? QUOTA_ALARM_COLOR : usedPercent >= LEVEL_WARN_PERCENT ? QUOTA_WARN_COLOR : QUOTA_OK_COLOR
+
+// Quota icon accent from the risk state: how far use runs ahead of the clock, or how close it is to the limit
+const _riskColor = (usedPercent: number, elapsedPercent: number | undefined): string => {
+  const overshoot = elapsedPercent === undefined ? 0 : usedPercent - elapsedPercent
+  if (overshoot >= OVERSHOOT_ALARM_POINTS || usedPercent >= LEVEL_ALARM_PERCENT) return QUOTA_ALARM_COLOR
+  if (overshoot >= OVERSHOOT_WARN_POINTS || usedPercent >= LEVEL_WARN_PERCENT) return QUOTA_WARN_COLOR
+  return QUOTA_OK_COLOR
+}
+
+const _barSvg = (key: TSegmentKey, usedPercent: number, barCells: number, options: IBarOptions = {}): string => {
+  const used = _clampPercent(usedPercent) / 100
+  const elapsed = key === SegmentKey.CONTEXT || options.elapsedPercent === undefined ? undefined : _clampPercent(options.elapsedPercent) / 100
+  const barPx = barCells * CELL_PX_ESTIMATE
+  const unitsPerPx = 1000 / barPx
+  const cap = (BAR_HEIGHT / 2) * unitsPerPx // half the bar height, in x units
+  const f = (value: number) => value.toFixed(2)
+
+  // Pills: each owns an equal share of the width, minus half a gap on each inner side.
+  // Too narrow for readable pills → one plain bar. (px per pill is computed directly so 84px / 7 is exactly 12.)
   let count = Math.max(1, Math.floor(options.segments ?? 1))
+  if (count > 1 && barPx / count < MIN_PILL_PX) count = 1
   const gap = count > 1 ? PILL_GAP_PX * unitsPerPx : 0
-  if (count > 1 && (1000 / count) / unitsPerPx < MIN_PILL_PX) count = 1
   const share = 1000 / count
-  const pills = Array.from({ length: count }, (_, i) => {
-    const start = i * share + cap + (i === 0 ? 0 : gap / 2)
-    const end = (i + 1) * share - cap - (i === count - 1 ? 0 : gap / 2)
-    return { start, end: Math.max(start, end) }
-  })
+  const pills = Array.from({ length: count }, (_, i) => ({
+    start: i * share + (i === 0 ? 0 : gap / 2),
+    end: (i + 1) * share - (i === count - 1 ? 0 : gap / 2)
+  }))
 
   // Maps a 0–1 fraction of the whole bar to an x inside the pills (fills skip the gaps)
   const xAt = (fraction: number): number => {
-    const scaled = Math.min(1, Math.max(0, fraction)) * count
+    const scaled = _clampUnit(fraction) * count
     const index = Math.min(count - 1, Math.floor(scaled))
     const pill = pills[index]!
     return pill.start + (pill.end - pill.start) * (scaled - index)
   }
 
+  const tipX = xAt(used)
+  const nowX = elapsed === undefined ? undefined : xAt(elapsed)
+  const hasBand = elapsed !== undefined && nowX !== undefined && used > elapsed
+
+  // Pill shape mask. Inner pill ends are rounded rectangles; the bar's outer ends are inset by `cap` and finished by a
+  // round-capped stroke, so the whole bar keeps its stadium silhouette
+  const radiusX = f(PILL_RADIUS_PX * unitsPerPx)
+  const mask = pills.map(({ start, end }, i) => {
+    const left = i === 0 ? start + cap : start
+    const right = i === count - 1 ? end - cap : end
+    return `<rect class="pill" x="${f(left)}" y="0" width="${f(Math.max(0, right - left))}" height="${BAR_HEIGHT}" rx="${radiusX}" ry="${PILL_RADIUS_PX}" fill="#fff"/>`
+  })
+  const outerCap = (x: number) =>
+    `<line x1="${f(x)}" y1="${BAR_HEIGHT / 2}" x2="${f(x + 0.01)}" y2="${BAR_HEIGHT / 2}" stroke="#fff" stroke-width="${BAR_HEIGHT}" stroke-linecap="round" vector-effect="non-scaling-stroke"/>`
+  mask.push(outerCap(cap), outerCap(1000 - cap - 0.01))
+
+  const defs: string[] = [`<mask id="pills-${key}" maskUnits="userSpaceOnUse" x="0" y="0" width="1000" height="${BAR_HEIGHT}">`, ...mask, '</mask>']
+  if (key === SegmentKey.CONTEXT) {
+    defs.push(
+      `<linearGradient id="grad-context" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="1000" y2="0">`,
+      '<stop offset="0" stop-color="#00c800"/><stop offset="0.5" stop-color="#ffc800"/><stop offset="1" stop-color="#ff0000"/>',
+      '</linearGradient>'
+    )
+  }
+  if (hasBand) {
+    // Anchored from the global `now` to the global fill tip, so the band reddens with how far ahead use runs
+    defs.push(
+      `<linearGradient id="band-${key}" gradientUnits="userSpaceOnUse" x1="${f(nowX)}" y1="0" x2="${f(tipX)}" y2="0">`,
+      `<stop offset="0" stop-color="${QUOTA_WARN_COLOR}"/><stop offset="1" stop-color="${QUOTA_ALARM_COLOR}"/>`,
+      '</linearGradient>'
+    )
+  }
+
+  const fillColor = key === SegmentKey.CONTEXT ? 'url(#grad-context)' : _levelColor(used * 100)
+  const rect = (cls: string, x1: number, x2: number, fill: string) =>
+    `<rect class="${cls}" x="${f(x1)}" y="0" width="${f(Math.max(0, x2 - x1))}" height="${BAR_HEIGHT}" fill="${fill}"/>`
   const parts = [
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 ${BAR_HEIGHT}" preserveAspectRatio="none" width="4000" height="${BAR_HEIGHT}">`,
     '<defs>',
-    `<linearGradient id="grad-${key}" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="1000" y2="0">`,
-    '<stop offset="0" stop-color="#ff0000"/><stop offset="0.5" stop-color="#ffc800"/><stop offset="1" stop-color="#00c800"/>',
-    '</linearGradient>',
+    ...defs,
     '</defs>',
-    '<g transform="translate(1000 0) scale(-1 1)">'
+    `<g mask="url(#pills-${key})">`,
+    rect('track', 0, 1000, EMPTY_COLOR)
   ]
-  pills.forEach(({ start, end }, i) => {
-    parts.push(`<line x1="${start.toFixed(2)}" y1="${centerY}" x2="${end.toFixed(2)}" y2="${centerY}" stroke="${EMPTY_COLOR}" ${lineAttrs}/>`)
-    const pillFill = Math.min(1, Math.max(0, filled * count - i))
-    if (pillFill > 0) {
-      const fillEnd = start + (end - start) * pillFill
-      parts.push(`<line x1="${start.toFixed(2)}" y1="${centerY}" x2="${fillEnd.toFixed(2)}" y2="${centerY}" stroke="url(#grad-${key})" ${lineAttrs}/>`)
-    }
-  })
-  if (options.pacePercent !== undefined) {
-    const x = xAt(options.pacePercent / 100).toFixed(2)
-    parts.push(`<line class="pace" x1="${x}" y1="0" x2="${x}" y2="${BAR_HEIGHT}" stroke="${PACE_COLOR}" stroke-width="2" vector-effect="non-scaling-stroke"/>`)
+  if (used > 0) parts.push(rect('fill', 0, tipX, fillColor))
+  if (hasBand) parts.push(rect('band', nowX, tipX, `url(#band-${key})`))
+  parts.push('</g>')
+
+  // `now` needle: 4px dark halo, then the 2px white core, full height, drawn last (kept clear of the image's edges)
+  if (nowX !== undefined) {
+    const haloHalf = 2 * unitsPerPx
+    const x = f(Math.min(1000 - haloHalf, Math.max(haloHalf, nowX)))
+    const needle = (cls: string, stroke: string, strokeWidth: number) =>
+      `<line class="${cls}" x1="${x}" y1="0" x2="${x}" y2="${BAR_HEIGHT}" stroke="${stroke}" stroke-width="${strokeWidth}" stroke-linecap="butt" vector-effect="non-scaling-stroke"/>`
+    parts.push(needle('needle-halo', NEEDLE_HALO_COLOR, 4), needle('needle', NEEDLE_COLOR, 2))
   }
-  parts.push('</g>', '</svg>')
+  parts.push('</svg>')
   return parts.join('')
 }
 
-// Even-use pace: share of the window still ahead, which is how much quota would be left if used evenly
-const _pacePercent = (resetsAt: number | undefined, nowMs: number, windowMs: number): number | undefined => {
-  if (resetsAt === undefined) return undefined
-  return Math.min(100, Math.max(0, ((resetsAt - nowMs) / windowMs) * 100))
+// Share of the window already gone by (0–100); undefined when the reset time is missing, invalid or past
+const _elapsedPercent = (resetsAt: number | undefined, nowMs: number, windowMs: number): number | undefined => {
+  if (resetsAt === undefined || !Number.isFinite(resetsAt) || resetsAt <= nowMs) return undefined
+  return _clampPercent(100 - ((resetsAt - nowMs) / windowMs) * 100)
 }
 
 // Resolves the display language: user option → Claude Code setting → LC_ALL / LC_MESSAGES / LANG → macOS → English
@@ -309,46 +393,89 @@ export const register: Register = (on, options) => {
     const segmentInputs = segmentCandidates.filter((segment) => segment !== null)
     if (segmentInputs.length === 0) return next(e)
 
-    // Fixed width of each bar's block = icon + gap (+ gap + countdown when there is one); blocks differ in width
+    // Per bar: used (clamped), its bare percent label, elapsed share of the window, and the reset countdown
+    const useds = segmentInputs.map((segment) => _clampPercent(segment.percent))
+    const percentLabels = useds.map((used) => `${Math.round(used)}%`)
+    const elapseds = segmentInputs.map(({ key, resetsAt }) =>
+      key === SegmentKey.WEEK ? _elapsedPercent(resetsAt, nowMs, WEEK_MS) : key === SegmentKey.FIVE ? _elapsedPercent(resetsAt, nowMs, FIVE_MS) : undefined
+    )
     const remainings = segmentInputs.map((segment) => _formatRemaining(segment.resetsAt, nowMs, messages))
     const timeSvgs = remainings.map((remaining) => (remaining ? _timeSvg(remaining, messages.rtl) : null))
-    const fixedWidths = timeSvgs.map((timeSvg) => ICON_CELLS + 1 + (timeSvg ? 1 + timeSvg.cells : 0))
 
-    // Equal-length bars filling the row: what is left after gaps and fixed widths is split evenly between the bars;
-    // every block also grows by the same flexGrow, absorbing the remainder and real glyph widths, so bars stay equal
-    const totalGap = SEGMENT_GAP * (segmentInputs.length - 1)
-    const totalFixed = fixedWidths.reduce((sum, width) => sum + width, 0)
-    const barLen = Math.max(MIN_BAR_LEN, Math.floor((e.props.bodyColumns - totalGap - totalFixed) / segmentInputs.length))
+    // Layout in one label style. Each block = icon · label slot · bar · countdown, with a 1-column gap between them;
+    // the label slot is the widest of the labels, the same for every block, so the bars stay equal.
+    // In a row: equal-length bars fill the row: what is left after block gaps and fixed widths is split evenly between the
+    // bars; every block also grows by the same flexGrow, absorbing the remainder and real glyph widths, so bars stay equal.
+    // Stacked (one block per row): every bar gets the width left beside the widest fixed part, so the bars line up and
+    // the countdowns start in one column. `showBar` / `showTime` drop the bar / countdown for the narrowest widths
+    const layoutFor = (style: TLabelStyle, { stacked = false, showBar = true, showTime = true } = {}) => {
+      const labelSvgs = percentLabels.map((label) => _labelSvg(label, style))
+      const labelCells = Math.max(...labelSvgs.map((svg) => svg.cells))
+      const segmentGap = stacked ? 0 : style === 'compact' ? COMPACT_SEGMENT_GAP : SEGMENT_GAP
+      const fixedWidths = timeSvgs.map(
+        (timeSvg) => ICON_CELLS + 1 + labelCells + (showBar ? 1 : 0) + (showTime && timeSvg ? 1 + timeSvg.cells : 0)
+      )
+      const totalGap = segmentGap * (segmentInputs.length - 1)
+      const totalFixed = fixedWidths.reduce((sum, width) => sum + width, 0)
+      const room = stacked
+        ? e.props.bodyColumns - Math.max(...fixedWidths)
+        : Math.floor((e.props.bodyColumns - totalGap - totalFixed) / segmentInputs.length)
+      const barLen = showBar ? Math.max(MIN_BAR_LEN, room) : 0
+      const fits = room >= (showBar ? MIN_BAR_LEN : 0)
+      return { labelSvgs, labelCells, segmentGap, fixedWidths, barLen, fits, stacked, showBar, showTime }
+    }
+    // Narrow mode: if the normal row leaves the bars too short for the 7-day pills, use compact labels and a 1-column gap
+    // (if that is still too short for pills, the bar's own plain-bar fallback applies). If the compact row cannot give
+    // every bar its minimum at all, the blocks are stacked one per row (normal labels when the bars still fit the 7-day
+    // pills, compact otherwise) rather than overflowing the row; a band taller than maxRows scrolls.
+    // Narrower still, the stacked blocks drop the bar (the icon's risk colour and the percent remain), then the countdown;
+    // when not even icon · percent fits, nothing is drawn
+    const pickLayout = () => {
+      const normal = layoutFor('normal')
+      if (normal.barLen >= NARROW_BAR_CELLS) return normal
+      const compact = layoutFor('compact')
+      if (compact.fits) return compact
+      const stackedNormal = layoutFor('normal', { stacked: true })
+      if (stackedNormal.barLen >= NARROW_BAR_CELLS) return stackedNormal
+      const tighter = [
+        layoutFor('compact', { stacked: true }),
+        layoutFor('compact', { stacked: true, showBar: false }),
+        layoutFor('compact', { stacked: true, showBar: false, showTime: false })
+      ]
+      return tighter.find((layout) => layout.fits) ?? null
+    }
+    const layout = pickLayout()
+    if (!layout) return next(e)
+    const { labelSvgs, labelCells, segmentGap, fixedWidths, barLen, stacked, showBar, showTime } = layout
 
-    // One block: icon (accent follows usage: green = plenty left, red = nearly out) + bar showing what is LEFT
-    // (outlined remaining percent centred on it) + time left until reset
-    const renderSegment = ({ key, name, percent, resetsAt }: ISegmentInput, index: number) => {
-      const left = Math.min(100, Math.max(0, 100 - percent))
-      // 5-hour and 7-day bars: one pill per hour / day plus the even-pace marker; context stays a plain bar
+    // One block: icon (context: accent follows usage; quotas: risk state) · used percent · bar · time left until reset
+    const renderSegment = ({ key, name }: ISegmentInput, index: number) => {
+      const used = useds[index] ?? 0
+      const elapsedPercent = elapseds[index]
+      // 5-hour and 7-day bars: one pill per hour / day plus the `now` needle; context stays a plain bar
       const barOptions: IBarOptions =
-        key === SegmentKey.WEEK
-          ? { segments: WEEK_DAYS, pacePercent: _pacePercent(resetsAt, nowMs, WEEK_MS) }
-          : key === SegmentKey.FIVE
-            ? { segments: FIVE_HOURS, pacePercent: _pacePercent(resetsAt, nowMs, FIVE_MS) }
-            : {}
-      const percentLabel = `${Math.round(left)}%`
+        key === SegmentKey.WEEK ? { segments: WEEK_DAYS, elapsedPercent } : key === SegmentKey.FIVE ? { segments: FIVE_HOURS, elapsedPercent } : {}
+      const accent = key === SegmentKey.CONTEXT ? _accentColor(used) : _riskColor(used, elapsedPercent)
+      const percentLabel = percentLabels[index] ?? ''
+      const percentSvg = labelSvgs[index]!
       const remaining = remainings[index] ?? ''
-      const timeSvg = timeSvgs[index] ?? null
+      const timeSvg = showTime ? (timeSvgs[index] ?? null) : null
       const segmentWidth = (fixedWidths[index] ?? 0) + barLen
       const alt = remaining ? `${name} ${percentLabel} (${remaining})` : `${name} ${percentLabel}`
-      const percentSvg = _labelSvg(percentLabel)
 
       return (
-        <Box key={key} flexDirection="row" alignItems="center" gap={1} width={segmentWidth} flexGrow={1} flexShrink={1}>
+        <Box key={key} flexDirection="row" alignItems="center" gap={1} width={segmentWidth} flexGrow={stacked ? 0 : 1} flexShrink={stacked ? 0 : 1}>
           <Box width={ICON_CELLS} flexShrink={0} justifyContent="center">
-            <Svg source={_iconSources[key](_accentColor(percent))} alt={name} width={ICON_SIZE} height={ICON_SIZE} />
+            <Svg source={_iconSources[key](accent)} alt={showBar ? name : alt} width={ICON_SIZE} height={ICON_SIZE} />
           </Box>
-          <Box position="relative" flexDirection="column" justifyContent="center" width={barLen} flexGrow={1} flexShrink={1}>
-            <Svg source={_barSvg(key, left, barLen, barOptions)} alt={alt} height={BAR_HEIGHT} />
-            <Box position="absolute" top={0} bottom={0} left={0} right={0} justifyContent="center" alignItems="center">
-              <Svg source={percentSvg.source} alt={percentLabel} width={percentSvg.width} height={LABEL_HEIGHT} />
+          <Box width={labelCells} flexShrink={0} justifyContent="flex-end">
+            <Svg source={percentSvg.source} alt={percentLabel} width={percentSvg.width} height={LABEL_HEIGHT} />
+          </Box>
+          {showBar ? (
+            <Box flexDirection="column" justifyContent="center" width={barLen} flexGrow={1} flexShrink={1}>
+              <Svg source={_barSvg(key, used, barLen, barOptions)} alt={alt} height={BAR_HEIGHT} />
             </Box>
-          </Box>
+          ) : null}
           {timeSvg ? (
             <Box width={timeSvg.cells} flexShrink={0} justifyContent="center">
               <Svg source={timeSvg.source} alt={remaining} width={timeSvg.width} height={TIME_HEIGHT} />
@@ -358,10 +485,14 @@ export const register: Register = (on, options) => {
       )
     }
 
-    // One row, no wrapping
+    // One row, no wrapping; or, when the row cannot fit, one block per row
     const segments = segmentInputs.map(renderSegment)
-    const barsRow = (
-      <Box flexDirection="row" flexWrap="nowrap" columnGap={SEGMENT_GAP} width={e.props.bodyColumns}>
+    const barsRow = stacked ? (
+      <Box flexDirection="column" width={e.props.bodyColumns}>
+        {segments}
+      </Box>
+    ) : (
+      <Box flexDirection="row" flexWrap="nowrap" columnGap={segmentGap} width={e.props.bodyColumns}>
         {segments}
       </Box>
     )

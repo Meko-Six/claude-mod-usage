@@ -2,7 +2,7 @@
 
 **English** · [简体中文](docs/README.zh-CN.md) · [繁體中文](docs/README.zh-TW.md) · [日本語](docs/README.ja.md) · [हिन्दी](docs/README.hi.md) · [Español](docs/README.es.md) · [العربية](docs/README.ar.md) · [Français](docs/README.fr.md) · [বাংলা](docs/README.bn.md) · [Português](docs/README.pt.md) · [Русский](docs/README.ru.md) · [Bahasa Indonesia](docs/README.id.md)
 
-A Claude Code Mod that shows your Claude usage as three gradient progress bars right above the prompt in **Claude Code Desktop** (also VS Code and the mobile app):
+A Claude Code Mod that shows your Claude usage as three progress bars right above the prompt in **Claude Code Desktop** (also VS Code and the mobile app):
 
 - **Context**: how full the current context window is
 - **5-hour limit**: your session usage, with the time left until it resets
@@ -12,9 +12,11 @@ A Claude Code Mod that shows your Claude usage as three gradient progress bars r
 
 ## Features
 
-- Green → yellow → red gradient bars with rounded ends; the icon's accent colour follows the usage too
-- The percentage sits in the middle of each bar, outlined so it stays readable on any colour
-- All bars have the same length and the row always uses the full width
+- Every bar fills left → right with the share **used**, with rounded ends
+- Context: a green → yellow → red gradient by how full the window is; the icon's accent follows it
+- 5-hour and 7-day: the track is the window's clock, split into 5 hour pills and 7 day pills. A white needle marks how much of the window has gone by. Fill short of the needle is headroom and stays green; fill past it (allowance spent ahead of schedule) is drawn as an amber → red band. The fill turns amber at 90% used and red at 97%, and the icon follows the same risk state
+- The percentage sits in a fixed slot left of each bar (`icon · 67% · bar · 13h45m`), outlined, so nothing covers the bar
+- All bars have the same length and the row always uses the full width; in narrow windows the labels get smaller and the gaps tighter so the 7-day pills stay, in very narrow ones the bars stack one per row, and at the narrowest the bar and then the countdown are dropped so nothing overflows
 - Reset countdown in a monospace font
 - Updates after every turn and whenever a limit moves by a whole point; the countdown ticks every minute
 - 12 languages, detected automatically
